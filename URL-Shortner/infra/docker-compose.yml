@@ -1,0 +1,153 @@
+# A single-dot dns_search clears any search domain the host's own resolv.conf
+# would otherwise leak into containers (common on home routers/ISP DHCP) -
+# without it, ndots:0 + a stray search domain can break single-label service
+# name lookups like "fastapi-postgres" with NXDOMAIN/"name resolution" errors.
+x-dns-search: &dns-search
+  dns_search: ["."]
+
+services:
+  fastapi-postgres:
+    <<: *dns-search
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: urlshortener
+    ports:
+      - "5433:5432"
+    volumes:
+      - fastapi_pg_data:/var/lib/postgresql/data
+      - ./init-sql/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks: [fastapi-net]
+
+  fastapi-redis:
+    <<: *dns-search
+    image: redis:7
+    ports:
+      - "6380:6379"
+    volumes:
+      - fastapi_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks: [fastapi-net]
+
+  fastapi-app:
+    <<: *dns-search
+    build: ../fastapi-service
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@fastapi-postgres:5432/urlshortener
+      REDIS_URL: redis://fastapi-redis:6379/0
+      BASE_URL: http://localhost:8001
+      # Milestone 7 experiment: `ANALYTICS_MODE=buffered docker compose up -d fastapi-app`
+      # to switch, then rerun the load test and compare against docs/06-results.md.
+      ANALYTICS_MODE: ${ANALYTICS_MODE:-sync_bg}
+    ports:
+      - "8001:8000"
+    depends_on:
+      fastapi-postgres:
+        condition: service_healthy
+      fastapi-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks: [fastapi-net, loadtest-net]
+
+  go-postgres:
+    <<: *dns-search
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: urlshortener
+    ports:
+      - "5434:5432"
+    volumes:
+      - go_pg_data:/var/lib/postgresql/data
+      - ./init-sql/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks: [go-net]
+
+  go-redis:
+    <<: *dns-search
+    image: redis:7
+    ports:
+      - "6381:6379"
+    volumes:
+      - go_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks: [go-net]
+
+  go-app:
+    <<: *dns-search
+    build: ../go-service
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@go-postgres:5432/urlshortener
+      REDIS_URL: redis://go-redis:6379/0
+      BASE_URL: http://localhost:8002
+    ports:
+      - "8002:8080"
+    depends_on:
+      go-postgres:
+        condition: service_healthy
+      go-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks: [go-net, loadtest-net]
+
+  # `docker compose up locust` serves the web UI at :8089 for interactive
+  # runs. For scripted/headless runs use:
+  #   docker compose run --rm locust -f locustfile.py --host <url> --headless ...
+  locust:
+    <<: *dns-search
+    build: ../loadtest
+    ports:
+      - "8089:8089"
+    volumes:
+      - ../loadtest:/mnt/loadtest
+    networks: [loadtest-net]
+
+  # CLI tool, not a long-running server - gated behind a profile so a plain
+  # `docker compose up` doesn't try to start it. Invoke with:
+  #   docker compose --profile tools run --rm k6 run --env BASE_URL=<url> k6_script.js
+  k6:
+    <<: *dns-search
+    image: grafana/k6:latest
+    profiles: ["tools"]
+    volumes:
+      - ../loadtest:/scripts
+    working_dir: /scripts
+    networks: [loadtest-net]
+
+networks:
+  fastapi-net:
+  go-net:
+  loadtest-net:
+
+volumes:
+  fastapi_pg_data:
+  fastapi_redis_data:
+  go_pg_data:
+  go_redis_data:
