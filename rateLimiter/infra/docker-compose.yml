@@ -1,0 +1,166 @@
+# Explicit project name: both this project and URL-Shortner have an
+# infra/docker-compose.yml, and Compose defaults the project name to the
+# containing directory ("infra") for both - without this, they'd share one
+# container/image/volume namespace. They also happen to reuse a few
+# identical service names (fastapi-redis, go-redis, locust), so without
+# this fix, bringing up one project's stack silently replaces the other's
+# same-named containers instead of creating separate ones. (Learned this
+# the hard way - see the project history.)
+name: ratelimiter
+
+# A single-dot dns_search clears any search domain the host's own resolv.conf
+# would otherwise leak into containers (common on home routers/ISP DHCP) -
+# without it, ndots:0 + a stray search domain can break single-label service
+# name lookups like "fastapi-redis" with NXDOMAIN/"name resolution" errors.
+# (Same fix URL-Shortner needed on this host.)
+x-dns-search: &dns-search
+  dns_search: ["."]
+
+services:
+  fastapi-redis:
+    <<: *dns-search
+    image: redis:7
+    ports:
+      # 6480, not 6380 - URL-Shortner already uses 6380/6381 on this host
+      # for its own Redis instances; distinct ports keep both projects
+      # runnable side by side.
+      - "6480:6379"
+    volumes:
+      - fastapi_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks: [fastapi-net]
+
+  # Two replicas sharing one Redis - this is what makes the distributed
+  # correctness proof (docs/03-distributed-correctness.md) meaningful in
+  # Compose, not just in ad-hoc local testing.
+  fastapi-app-1:
+    <<: *dns-search
+    build: ../fastapi-service
+    environment:
+      REDIS_URL: redis://fastapi-redis:6379/0
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-redis}
+      RATE_LIMIT_DEFAULT_LIMIT: ${RATE_LIMIT_DEFAULT_LIMIT:-10}
+      RATE_LIMIT_DEFAULT_WINDOW_SECONDS: ${RATE_LIMIT_DEFAULT_WINDOW_SECONDS:-10}
+    ports:
+      - "8101:8000"
+    depends_on:
+      fastapi-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks: [fastapi-net, loadtest-net]
+
+  fastapi-app-2:
+    <<: *dns-search
+    build: ../fastapi-service
+    environment:
+      REDIS_URL: redis://fastapi-redis:6379/0
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-redis}
+      RATE_LIMIT_DEFAULT_LIMIT: ${RATE_LIMIT_DEFAULT_LIMIT:-10}
+      RATE_LIMIT_DEFAULT_WINDOW_SECONDS: ${RATE_LIMIT_DEFAULT_WINDOW_SECONDS:-10}
+    ports:
+      - "8102:8000"
+    depends_on:
+      fastapi-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks: [fastapi-net, loadtest-net]
+
+  go-redis:
+    <<: *dns-search
+    image: redis:7
+    ports:
+      - "6481:6379"
+    volumes:
+      - go_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks: [go-net]
+
+  go-app-1:
+    <<: *dns-search
+    build: ../go-service
+    environment:
+      REDIS_URL: redis://go-redis:6379/0
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-redis}
+      RATE_LIMIT_DEFAULT_LIMIT: ${RATE_LIMIT_DEFAULT_LIMIT:-10}
+      RATE_LIMIT_DEFAULT_WINDOW_SECONDS: ${RATE_LIMIT_DEFAULT_WINDOW_SECONDS:-10}
+    ports:
+      - "8201:8080"
+    depends_on:
+      go-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks: [go-net, loadtest-net]
+
+  go-app-2:
+    <<: *dns-search
+    build: ../go-service
+    environment:
+      REDIS_URL: redis://go-redis:6379/0
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-redis}
+      RATE_LIMIT_DEFAULT_LIMIT: ${RATE_LIMIT_DEFAULT_LIMIT:-10}
+      RATE_LIMIT_DEFAULT_WINDOW_SECONDS: ${RATE_LIMIT_DEFAULT_WINDOW_SECONDS:-10}
+    ports:
+      - "8202:8080"
+    depends_on:
+      go-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks: [go-net, loadtest-net]
+
+  # `docker compose up locust` serves the web UI at :9089 (not URL-Shortner's
+  # 8089, so both projects' web UIs can run at once) for interactive runs.
+  # For scripted/headless runs use:
+  #   docker compose run --rm locust -f locustfile.py --host <url> --headless ...
+  locust:
+    <<: *dns-search
+    build: ../loadtest
+    ports:
+      - "9089:8089"
+    volumes:
+      - ../loadtest:/mnt/loadtest
+    networks: [loadtest-net]
+
+  # CLI tool, not a long-running server - gated behind a profile so a plain
+  # `docker compose up` doesn't try to start it. Invoke with:
+  #   docker compose --profile tools run --rm k6 run --env BASE_URL=<url> k6_script.js
+  k6:
+    <<: *dns-search
+    image: grafana/k6:latest
+    profiles: ["tools"]
+    volumes:
+      - ../loadtest:/scripts
+    working_dir: /scripts
+    networks: [loadtest-net]
+
+networks:
+  fastapi-net:
+  go-net:
+  loadtest-net:
+
+volumes:
+  fastapi_redis_data:
+  go_redis_data:
